@@ -31,21 +31,22 @@ var (
 )
 
 type config struct {
-	ListenAddr         string
-	DatabaseURL        string
-	ExternalBaseURL    string
-	CallbackPath       string
-	Issuer             string
-	ClientID           string
-	ClientSecret       string
-	Scope              string
-	StateTTL           time.Duration
-	ExchangeCodeTTL    time.Duration
-	CleanupInterval    time.Duration
-	AppCodeParam       string
-	AdminAPIToken      string
-	CORSAllowAll       bool
-	CORSAllowedOrigins map[string]struct{}
+	ListenAddr          string
+	DatabaseURL         string
+	ExternalBaseURL     string
+	CallbackPath        string
+	Issuer              string
+	ClientID            string
+	ClientSecret        string
+	Scope               string
+	HasuraTokenAudience string
+	StateTTL            time.Duration
+	ExchangeCodeTTL     time.Duration
+	CleanupInterval     time.Duration
+	AppCodeParam        string
+	AdminAPIToken       string
+	CORSAllowAll        bool
+	CORSAllowedOrigins  map[string]struct{}
 }
 
 type server struct {
@@ -104,6 +105,14 @@ type exchangeResponse struct {
 	ExpiresIn    int       `json:"expires_in,omitempty"`
 	Scope        string    `json:"scope,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at"`
+}
+
+type exchangeRequest struct {
+	Code                string `json:"code"`
+	AppSlug             string `json:"app_slug"`
+	RequestedAudience   string `json:"requested_audience,omitempty"`
+	RequestedScope      string `json:"requested_scope,omitempty"`
+	RequestHasuraClaims bool   `json:"request_hasura_claims,omitempty"`
 }
 
 func main() {
@@ -184,16 +193,17 @@ func main() {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		ListenAddr:      getEnv("LISTEN_ADDR", ":8080"),
-		ExternalBaseURL: strings.TrimRight(getEnv("EXTERNAL_BASE_URL", "https://login.suncoast.systems"), "/"),
-		CallbackPath:    normalizeCallbackPath(getEnv("CALLBACK_PATH", "/callback")),
-		Issuer:          strings.TrimRight(getEnv("KEYCLOAK_ISSUER", "https://auth.suncoast.systems/realms/external"), "/"),
-		ClientID:        getEnv("OIDC_CLIENT_ID", "auth-gateway-public"),
-		Scope:           getEnv("OIDC_SCOPE", "openid profile email"),
-		StateTTL:        parseDurationEnv("STATE_TTL", 10*time.Minute),
-		ExchangeCodeTTL: parseDurationEnv("EXCHANGE_CODE_TTL", 2*time.Minute),
-		CleanupInterval: parseDurationEnv("CLEANUP_INTERVAL", 5*time.Minute),
-		AppCodeParam:    getEnv("APP_CODE_PARAM", "gateway_code"),
+		ListenAddr:          getEnv("LISTEN_ADDR", ":8080"),
+		ExternalBaseURL:     strings.TrimRight(getEnv("EXTERNAL_BASE_URL", "https://login.suncoast.systems"), "/"),
+		CallbackPath:        normalizeCallbackPath(getEnv("CALLBACK_PATH", "/callback")),
+		Issuer:              strings.TrimRight(getEnv("KEYCLOAK_ISSUER", "https://auth.suncoast.systems/realms/external"), "/"),
+		ClientID:            getEnv("OIDC_CLIENT_ID", "auth-gateway-public"),
+		Scope:               getEnv("OIDC_SCOPE", "openid profile email"),
+		HasuraTokenAudience: strings.TrimSpace(getEnv("HASURA_TOKEN_AUDIENCE", "")),
+		StateTTL:            parseDurationEnv("STATE_TTL", 10*time.Minute),
+		ExchangeCodeTTL:     parseDurationEnv("EXCHANGE_CODE_TTL", 2*time.Minute),
+		CleanupInterval:     parseDurationEnv("CLEANUP_INTERVAL", 5*time.Minute),
+		AppCodeParam:        getEnv("APP_CODE_PARAM", "gateway_code"),
 	}
 
 	if cfg.AppCodeParam == "" {
@@ -491,19 +501,26 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Code    string `json:"code"`
-		AppSlug string `json:"app_slug"`
-	}
+	var req exchangeRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	req.Code = strings.TrimSpace(req.Code)
 	req.AppSlug = strings.TrimSpace(req.AppSlug)
+	req.RequestedAudience = strings.TrimSpace(req.RequestedAudience)
+	req.RequestedScope = strings.TrimSpace(req.RequestedScope)
 	if req.Code == "" {
 		writeError(w, http.StatusBadRequest, "code is required")
 		return
+	}
+
+	if req.RequestHasuraClaims && req.RequestedAudience == "" {
+		req.RequestedAudience = s.cfg.HasuraTokenAudience
+		if req.RequestedAudience == "" {
+			writeError(w, http.StatusBadRequest, "HASURA_TOKEN_AUDIENCE is not configured")
+			return
+		}
 	}
 
 	resp, err := s.consumeExchangeCode(r.Context(), req.Code)
@@ -519,6 +536,27 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	if req.AppSlug != "" && req.AppSlug != resp.AppSlug {
 		writeError(w, http.StatusForbidden, "code does not belong to requested app")
 		return
+	}
+
+	if req.RequestedAudience != "" || req.RequestedScope != "" {
+		exchanged, err := s.exchangeAccessToken(r.Context(), resp.AccessToken, req.RequestedAudience, req.RequestedScope)
+		if err != nil {
+			s.logger.Printf("token exchange failed: %v", err)
+			writeError(w, http.StatusBadGateway, "token exchange failed")
+			return
+		}
+		resp.AccessToken = exchanged.AccessToken
+		resp.IDToken = exchanged.IDToken
+		resp.RefreshToken = exchanged.RefreshToken
+		resp.TokenType = exchanged.TokenType
+		resp.ExpiresIn = exchanged.ExpiresIn
+		resp.Scope = exchanged.Scope
+		if exchanged.ExpiresIn > 0 {
+			resp.ExpiresAt = time.Now().UTC().Add(time.Duration(exchanged.ExpiresIn) * time.Second)
+		}
+		if subject := extractSubject(exchanged.IDToken); subject != "" {
+			resp.Subject = subject
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -802,6 +840,54 @@ func (s *server) exchangeAuthorizationCode(ctx context.Context, code, codeVerifi
 	}
 	if out.AccessToken == "" {
 		return tokenResponse{}, fmt.Errorf("token response missing access_token")
+	}
+	return out, nil
+}
+
+func (s *server) exchangeAccessToken(ctx context.Context, subjectToken, audience, scope string) (tokenResponse, error) {
+	endpoint := s.cfg.Issuer + "/protocol/openid-connect/token"
+	form := url.Values{}
+	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+	form.Set("client_id", s.cfg.ClientID)
+	form.Set("subject_token", subjectToken)
+	form.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	form.Set("requested_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	if audience != "" {
+		form.Set("audience", audience)
+	}
+	if scope != "" {
+		form.Set("scope", scope)
+	}
+	if s.cfg.ClientSecret != "" {
+		form.Set("client_secret", s.cfg.ClientSecret)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return tokenResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	res, err := s.http.Do(req)
+	if err != nil {
+		return tokenResponse{}, err
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
+	if err != nil {
+		return tokenResponse{}, err
+	}
+	if res.StatusCode != http.StatusOK {
+		return tokenResponse{}, fmt.Errorf("token exchange endpoint returned %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var out tokenResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return tokenResponse{}, err
+	}
+	if out.AccessToken == "" {
+		return tokenResponse{}, fmt.Errorf("token exchange response missing access_token")
 	}
 	return out, nil
 }

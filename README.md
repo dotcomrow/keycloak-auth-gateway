@@ -54,6 +54,34 @@ curl -X POST http://localhost:8080/v1/auth/exchange \
   -d '{"code":"<gateway_code>","app_slug":"shell"}'
 ```
 
+## Exchange With Requested Claims/Audience
+
+To keep default behavior unchanged, token shaping is opt-in at exchange time.
+
+Request a token exchange for a specific audience:
+
+```sh
+curl -X POST http://localhost:8080/v1/auth/exchange \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "code":"<gateway_code>",
+    "app_slug":"shell",
+    "requested_audience":"graphql-api-7603d234"
+  }'
+```
+
+Request Hasura claims using a configured audience shortcut:
+
+```sh
+curl -X POST http://localhost:8080/v1/auth/exchange \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "code":"<gateway_code>",
+    "app_slug":"shell",
+    "request_hasura_claims": true
+  }'
+```
+
 ## Configuration
 
 ### Required
@@ -68,6 +96,7 @@ curl -X POST http://localhost:8080/v1/auth/exchange \
 - `OIDC_CLIENT_SECRET` or `OIDC_CLIENT_SECRET_FILE`
 - `ADMIN_API_TOKEN` or `ADMIN_API_TOKEN_FILE`
 - `CORS_ALLOW_ORIGINS` (comma-separated list or `*`)
+- `HASURA_TOKEN_AUDIENCE` (used when `request_hasura_claims=true`)
 - `STATE_TTL` (default `10m`)
 - `EXCHANGE_CODE_TTL` (default `2m`)
 - `APP_CODE_PARAM` (default `gateway_code`)
