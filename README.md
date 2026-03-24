@@ -70,7 +70,7 @@ curl -X POST http://localhost:8080/v1/auth/exchange \
   }'
 ```
 
-Request Hasura claims using a configured audience shortcut:
+Request Hasura claims using the configured Hasura audience lookup:
 
 ```sh
 curl -X POST http://localhost:8080/v1/auth/exchange \
@@ -81,6 +81,16 @@ curl -X POST http://localhost:8080/v1/auth/exchange \
     "request_hasura_claims": true
   }'
 ```
+
+When `request_hasura_claims=true` and `requested_audience` is not provided, the audience is resolved in this order:
+
+1. Vault lookup (`HASURA_TOKEN_AUDIENCE_VAULT_PATH`, if configured)
+2. Fallback static value (`HASURA_TOKEN_AUDIENCE` or `HASURA_TOKEN_AUDIENCE_FILE`)
+
+Vault lookup supports `{app_slug}` in the path template. Example:
+
+- `HASURA_TOKEN_AUDIENCE_VAULT_PATH=kv/data/keycloak/hasura/{app_slug}`
+- `HASURA_TOKEN_AUDIENCE_VAULT_KEY=audience`
 
 ## Configuration
 
@@ -96,7 +106,11 @@ curl -X POST http://localhost:8080/v1/auth/exchange \
 - `OIDC_CLIENT_SECRET` or `OIDC_CLIENT_SECRET_FILE`
 - `ADMIN_API_TOKEN` or `ADMIN_API_TOKEN_FILE`
 - `CORS_ALLOW_ORIGINS` (comma-separated list or `*`)
-- `HASURA_TOKEN_AUDIENCE` (used when `request_hasura_claims=true`)
+- `HASURA_TOKEN_AUDIENCE` or `HASURA_TOKEN_AUDIENCE_FILE` (fallback when `request_hasura_claims=true`)
+- `VAULT_ADDR` (required when `HASURA_TOKEN_AUDIENCE_VAULT_PATH` is set)
+- `VAULT_TOKEN` or `VAULT_TOKEN_FILE` (required when `HASURA_TOKEN_AUDIENCE_VAULT_PATH` is set)
+- `HASURA_TOKEN_AUDIENCE_VAULT_PATH` (Vault API path; can include `{app_slug}`)
+- `HASURA_TOKEN_AUDIENCE_VAULT_KEY` (field name in the Vault secret, default `audience`)
 - `STATE_TTL` (default `10m`)
 - `EXCHANGE_CODE_TTL` (default `2m`)
 - `APP_CODE_PARAM` (default `gateway_code`)

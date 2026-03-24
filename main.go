@@ -26,8 +26,9 @@ import (
 var slugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}$`)
 
 var (
-	errNotFound = errors.New("not found")
-	errExpired  = errors.New("expired")
+	errNotFound                    = errors.New("not found")
+	errExpired                     = errors.New("expired")
+	errHasuraAudienceNotConfigured = errors.New("hasura audience is not configured")
 )
 
 type config struct {
@@ -40,6 +41,10 @@ type config struct {
 	ClientSecret        string
 	Scope               string
 	HasuraTokenAudience string
+	VaultAddr           string
+	VaultToken          string
+	HasuraAudiencePath  string
+	HasuraAudienceKey   string
 	StateTTL            time.Duration
 	ExchangeCodeTTL     time.Duration
 	CleanupInterval     time.Duration
@@ -199,7 +204,9 @@ func loadConfig() (config, error) {
 		Issuer:              strings.TrimRight(getEnv("KEYCLOAK_ISSUER", "https://auth.suncoast.systems/realms/external"), "/"),
 		ClientID:            getEnv("OIDC_CLIENT_ID", "auth-gateway-public"),
 		Scope:               getEnv("OIDC_SCOPE", "openid profile email"),
-		HasuraTokenAudience: strings.TrimSpace(getEnv("HASURA_TOKEN_AUDIENCE", "")),
+		VaultAddr:           strings.TrimRight(getEnv("VAULT_ADDR", ""), "/"),
+		HasuraAudiencePath:  strings.TrimSpace(getEnv("HASURA_TOKEN_AUDIENCE_VAULT_PATH", "")),
+		HasuraAudienceKey:   strings.TrimSpace(getEnv("HASURA_TOKEN_AUDIENCE_VAULT_KEY", "audience")),
 		StateTTL:            parseDurationEnv("STATE_TTL", 10*time.Minute),
 		ExchangeCodeTTL:     parseDurationEnv("EXCHANGE_CODE_TTL", 2*time.Minute),
 		CleanupInterval:     parseDurationEnv("CLEANUP_INTERVAL", 5*time.Minute),
@@ -227,11 +234,35 @@ func loadConfig() (config, error) {
 	}
 	cfg.ClientSecret = clientSecret
 
+	vaultToken, err := envOrFile("VAULT_TOKEN", "VAULT_TOKEN_FILE")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.VaultToken = strings.TrimSpace(vaultToken)
+
+	hasuraAudience, err := envOrFile("HASURA_TOKEN_AUDIENCE", "HASURA_TOKEN_AUDIENCE_FILE")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.HasuraTokenAudience = strings.TrimSpace(hasuraAudience)
+
 	adminToken, err := envOrFile("ADMIN_API_TOKEN", "ADMIN_API_TOKEN_FILE")
 	if err != nil {
 		return cfg, err
 	}
 	cfg.AdminAPIToken = adminToken
+
+	if cfg.HasuraAudienceKey == "" {
+		cfg.HasuraAudienceKey = "audience"
+	}
+	if cfg.HasuraAudiencePath != "" {
+		if cfg.VaultAddr == "" {
+			return cfg, fmt.Errorf("VAULT_ADDR is required when HASURA_TOKEN_AUDIENCE_VAULT_PATH is set")
+		}
+		if cfg.VaultToken == "" {
+			return cfg, fmt.Errorf("VAULT_TOKEN or VAULT_TOKEN_FILE is required when HASURA_TOKEN_AUDIENCE_VAULT_PATH is set")
+		}
+	}
 
 	cfg.CORSAllowAll, cfg.CORSAllowedOrigins = parseAllowedOrigins(getEnv("CORS_ALLOW_ORIGINS", ""))
 
@@ -515,14 +546,6 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.RequestHasuraClaims && req.RequestedAudience == "" {
-		req.RequestedAudience = s.cfg.HasuraTokenAudience
-		if req.RequestedAudience == "" {
-			writeError(w, http.StatusBadRequest, "HASURA_TOKEN_AUDIENCE is not configured")
-			return
-		}
-	}
-
 	resp, err := s.consumeExchangeCode(r.Context(), req.Code)
 	if err != nil {
 		if errors.Is(err, errNotFound) || errors.Is(err, errExpired) {
@@ -536,6 +559,19 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	if req.AppSlug != "" && req.AppSlug != resp.AppSlug {
 		writeError(w, http.StatusForbidden, "code does not belong to requested app")
 		return
+	}
+	if req.RequestHasuraClaims && req.RequestedAudience == "" {
+		audience, err := s.resolveHasuraAudience(r.Context(), resp.AppSlug)
+		if err != nil {
+			s.logger.Printf("resolve hasura audience failed for app %q: %v", resp.AppSlug, err)
+			if errors.Is(err, errHasuraAudienceNotConfigured) {
+				writeError(w, http.StatusBadRequest, "hasura audience is not configured")
+				return
+			}
+			writeError(w, http.StatusBadGateway, "failed to resolve hasura audience")
+			return
+		}
+		req.RequestedAudience = audience
 	}
 
 	if req.RequestedAudience != "" || req.RequestedScope != "" {
@@ -890,6 +926,103 @@ func (s *server) exchangeAccessToken(ctx context.Context, subjectToken, audience
 		return tokenResponse{}, fmt.Errorf("token exchange response missing access_token")
 	}
 	return out, nil
+}
+
+func (s *server) resolveHasuraAudience(ctx context.Context, appSlug string) (string, error) {
+	if s.cfg.HasuraAudiencePath != "" {
+		return s.lookupHasuraAudienceFromVault(ctx, appSlug)
+	}
+	if s.cfg.HasuraTokenAudience != "" {
+		return s.cfg.HasuraTokenAudience, nil
+	}
+	return "", errHasuraAudienceNotConfigured
+}
+
+func (s *server) lookupHasuraAudienceFromVault(ctx context.Context, appSlug string) (string, error) {
+	secretPath := s.cfg.HasuraAudiencePath
+	if strings.Contains(secretPath, "{app_slug}") {
+		if appSlug == "" {
+			return "", fmt.Errorf("vault path template requires app slug")
+		}
+		secretPath = strings.ReplaceAll(secretPath, "{app_slug}", appSlug)
+	}
+	secretPath = strings.TrimSpace(strings.TrimPrefix(secretPath, "/"))
+	if secretPath == "" {
+		return "", errHasuraAudienceNotConfigured
+	}
+
+	endpointPath := secretPath
+	if !strings.HasPrefix(endpointPath, "v1/") {
+		endpointPath = "v1/" + endpointPath
+	}
+	endpoint := strings.TrimRight(s.cfg.VaultAddr, "/") + "/" + endpointPath
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-Vault-Token", s.cfg.VaultToken)
+	req.Header.Set("Accept", "application/json")
+
+	res, err := s.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
+	if err != nil {
+		return "", err
+	}
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("vault read returned %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("vault response decode: %w", err)
+	}
+	if audience, ok := readVaultString(payload, s.cfg.HasuraAudienceKey); ok {
+		return audience, nil
+	}
+	return "", fmt.Errorf("vault response missing %q", s.cfg.HasuraAudienceKey)
+}
+
+func readVaultString(payload map[string]any, key string) (string, bool) {
+	dataRaw, ok := payload["data"]
+	if !ok {
+		return "", false
+	}
+	data, ok := dataRaw.(map[string]any)
+	if !ok {
+		return "", false
+	}
+
+	// KV v2 stores user fields under data.data.
+	if innerRaw, ok := data["data"]; ok {
+		inner, ok := innerRaw.(map[string]any)
+		if ok {
+			if out, ok := readMapString(inner, key); ok {
+				return out, true
+			}
+		}
+	}
+
+	// KV v1 stores user fields directly under data.
+	return readMapString(data, key)
+}
+
+func readMapString(m map[string]any, key string) (string, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return "", false
+	}
+	out, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	out = strings.TrimSpace(out)
+	return out, out != ""
 }
 
 func (s *server) buildAuthorizeURL(state, nonce, codeVerifier string) string {
