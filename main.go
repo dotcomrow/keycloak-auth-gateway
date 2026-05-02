@@ -39,6 +39,8 @@ type config struct {
 	Issuer              string
 	ClientID            string
 	ClientSecret        string
+	ExchangeClientID    string
+	ExchangeClientSecret string
 	Scope               string
 	HasuraTokenAudience string
 	VaultAddr           string
@@ -120,6 +122,29 @@ type exchangeRequest struct {
 	RequestHasuraClaims bool   `json:"request_hasura_claims,omitempty"`
 }
 
+type audienceExchangeRequest struct {
+	AppSlug             string   `json:"app_slug"`
+	SubjectToken        string   `json:"subject_token,omitempty"`
+	RequestedAudience   string   `json:"requested_audience,omitempty"`
+	RequestedAudiences  []string `json:"requested_audiences,omitempty"`
+	RequestedScope      string   `json:"requested_scope,omitempty"`
+	RequestHasuraClaims bool     `json:"request_hasura_claims,omitempty"`
+}
+
+type audienceExchangeResponse struct {
+	AppSlug            string    `json:"app_slug"`
+	Subject            string    `json:"subject,omitempty"`
+	AccessToken        string    `json:"access_token"`
+	IDToken            string    `json:"id_token,omitempty"`
+	RefreshToken       string    `json:"refresh_token,omitempty"`
+	TokenType          string    `json:"token_type,omitempty"`
+	ExpiresIn          int       `json:"expires_in,omitempty"`
+	Scope              string    `json:"scope,omitempty"`
+	ExpiresAt          time.Time `json:"expires_at"`
+	RequestedAudience  string    `json:"requested_audience,omitempty"`
+	RequestedAudiences []string  `json:"requested_audiences,omitempty"`
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -168,6 +193,7 @@ func main() {
 	mux.HandleFunc("/start", s.handleStart)
 	mux.HandleFunc("/callback", s.handleCallback)
 	mux.HandleFunc("/v1/auth/exchange", s.handleExchange)
+	mux.HandleFunc("/v1/auth/token-exchange", s.handleTokenExchange)
 	mux.HandleFunc("/v1/apps", s.withAdminAuth(s.handleApps))
 	mux.HandleFunc("/v1/apps/", s.withAdminAuth(s.handleAppBySlug))
 
@@ -212,6 +238,10 @@ func loadConfig() (config, error) {
 		CleanupInterval:     parseDurationEnv("CLEANUP_INTERVAL", 5*time.Minute),
 		AppCodeParam:        getEnv("APP_CODE_PARAM", "gateway_code"),
 	}
+	cfg.ExchangeClientID = strings.TrimSpace(getEnv("OIDC_EXCHANGE_CLIENT_ID", ""))
+	if cfg.ExchangeClientID == "" {
+		cfg.ExchangeClientID = cfg.ClientID
+	}
 
 	if cfg.AppCodeParam == "" {
 		cfg.AppCodeParam = "gateway_code"
@@ -233,6 +263,15 @@ func loadConfig() (config, error) {
 		return cfg, err
 	}
 	cfg.ClientSecret = clientSecret
+
+	exchangeClientSecret, err := envOrFile("OIDC_EXCHANGE_CLIENT_SECRET", "OIDC_EXCHANGE_CLIENT_SECRET_FILE")
+	if err != nil {
+		return cfg, err
+	}
+	if exchangeClientSecret == "" {
+		exchangeClientSecret = cfg.ClientSecret
+	}
+	cfg.ExchangeClientSecret = exchangeClientSecret
 
 	vaultToken, err := envOrFile("VAULT_TOKEN", "VAULT_TOKEN_FILE")
 	if err != nil {
@@ -575,7 +614,12 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.RequestedAudience != "" || req.RequestedScope != "" {
-		exchanged, err := s.exchangeAccessToken(r.Context(), resp.AccessToken, req.RequestedAudience, req.RequestedScope)
+		exchanged, err := s.exchangeAccessToken(
+			r.Context(),
+			resp.AccessToken,
+			audienceList(req.RequestedAudience, nil),
+			req.RequestedScope,
+		)
 		if err != nil {
 			s.logger.Printf("token exchange failed: %v", err)
 			writeError(w, http.StatusBadGateway, "token exchange failed")
@@ -593,6 +637,110 @@ func (s *server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		if subject := extractSubject(exchanged.IDToken); subject != "" {
 			resp.Subject = subject
 		}
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req audienceExchangeRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	req.AppSlug = strings.TrimSpace(req.AppSlug)
+	req.SubjectToken = strings.TrimSpace(req.SubjectToken)
+	req.RequestedAudience = strings.TrimSpace(req.RequestedAudience)
+	req.RequestedScope = strings.TrimSpace(req.RequestedScope)
+	req.RequestedAudiences = trimAndDedupeStrings(req.RequestedAudiences)
+
+	if req.AppSlug == "" {
+		writeError(w, http.StatusBadRequest, "app_slug is required")
+		return
+	}
+
+	app, err := s.getApp(r.Context(), req.AppSlug)
+	if err != nil {
+		if errors.Is(err, errNotFound) {
+			writeError(w, http.StatusNotFound, "app not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load app")
+		return
+	}
+	if !app.Enabled {
+		writeError(w, http.StatusForbidden, "app is disabled")
+		return
+	}
+
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" && !sameOriginString(origin, app.BaseURL) {
+		writeError(w, http.StatusForbidden, "origin does not match app base_url")
+		return
+	}
+
+	subjectToken := req.SubjectToken
+	if subjectToken == "" {
+		subjectToken = bearerTokenFromHeader(r.Header.Get("Authorization"))
+	}
+	if subjectToken == "" {
+		writeError(w, http.StatusBadRequest, "subject token is required")
+		return
+	}
+
+	audiences := audienceList(req.RequestedAudience, req.RequestedAudiences)
+	if req.RequestHasuraClaims && len(audiences) == 0 {
+		resolvedAudience, err := s.resolveHasuraAudience(r.Context(), req.AppSlug)
+		if err != nil {
+			s.logger.Printf("resolve hasura audience failed for app %q: %v", req.AppSlug, err)
+			if errors.Is(err, errHasuraAudienceNotConfigured) {
+				writeError(w, http.StatusBadRequest, "hasura audience is not configured")
+				return
+			}
+			writeError(w, http.StatusBadGateway, "failed to resolve hasura audience")
+			return
+		}
+		audiences = audienceList(resolvedAudience, audiences)
+	}
+
+	if len(audiences) == 0 && req.RequestedScope == "" {
+		writeError(
+			w,
+			http.StatusBadRequest,
+			"requested_audience, requested_audiences, requested_scope, or request_hasura_claims is required",
+		)
+		return
+	}
+
+	exchanged, err := s.exchangeAccessToken(r.Context(), subjectToken, audiences, req.RequestedScope)
+	if err != nil {
+		s.logger.Printf("token exchange failed for app %q: %v", req.AppSlug, err)
+		writeError(w, http.StatusBadGateway, "token exchange failed")
+		return
+	}
+
+	resp := audienceExchangeResponse{
+		AppSlug:            req.AppSlug,
+		Subject:            extractSubject(exchanged.IDToken),
+		AccessToken:        exchanged.AccessToken,
+		IDToken:            exchanged.IDToken,
+		RefreshToken:       exchanged.RefreshToken,
+		TokenType:          exchanged.TokenType,
+		ExpiresIn:          exchanged.ExpiresIn,
+		Scope:              exchanged.Scope,
+		RequestedAudiences: audiences,
+	}
+	if len(audiences) > 0 {
+		resp.RequestedAudience = audiences[0]
+	}
+	if exchanged.ExpiresIn > 0 {
+		resp.ExpiresAt = time.Now().UTC().Add(time.Duration(exchanged.ExpiresIn) * time.Second)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -880,22 +1028,26 @@ func (s *server) exchangeAuthorizationCode(ctx context.Context, code, codeVerifi
 	return out, nil
 }
 
-func (s *server) exchangeAccessToken(ctx context.Context, subjectToken, audience, scope string) (tokenResponse, error) {
+func (s *server) exchangeAccessToken(ctx context.Context, subjectToken string, audiences []string, scope string) (tokenResponse, error) {
 	endpoint := s.cfg.Issuer + "/protocol/openid-connect/token"
 	form := url.Values{}
 	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
-	form.Set("client_id", s.cfg.ClientID)
+	form.Set("client_id", s.cfg.ExchangeClientID)
 	form.Set("subject_token", subjectToken)
 	form.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
 	form.Set("requested_token_type", "urn:ietf:params:oauth:token-type:access_token")
-	if audience != "" {
-		form.Set("audience", audience)
+	for _, audience := range audiences {
+		audience = strings.TrimSpace(audience)
+		if audience == "" {
+			continue
+		}
+		form.Add("audience", audience)
 	}
 	if scope != "" {
 		form.Set("scope", scope)
 	}
-	if s.cfg.ClientSecret != "" {
-		form.Set("client_secret", s.cfg.ClientSecret)
+	if s.cfg.ExchangeClientSecret != "" {
+		form.Set("client_secret", s.cfg.ExchangeClientSecret)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
@@ -926,6 +1078,61 @@ func (s *server) exchangeAccessToken(ctx context.Context, subjectToken, audience
 		return tokenResponse{}, fmt.Errorf("token exchange response missing access_token")
 	}
 	return out, nil
+}
+
+func bearerTokenFromHeader(headerValue string) string {
+	value := strings.TrimSpace(headerValue)
+	if value == "" {
+		return ""
+	}
+	const bearerPrefix = "bearer "
+	if len(value) <= len(bearerPrefix) || strings.ToLower(value[:len(bearerPrefix)]) != bearerPrefix {
+		return ""
+	}
+	return strings.TrimSpace(value[len(bearerPrefix):])
+}
+
+func trimAndDedupeStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func audienceList(single string, many []string) []string {
+	values := make([]string, 0, len(many)+1)
+	if single != "" {
+		values = append(values, single)
+	}
+	values = append(values, many...)
+	return trimAndDedupeStrings(values)
+}
+
+func sameOriginString(originRaw, baseURLRaw string) bool {
+	originRaw = strings.TrimSpace(originRaw)
+	baseURLRaw = strings.TrimSpace(baseURLRaw)
+	if originRaw == "" || baseURLRaw == "" {
+		return false
+	}
+	originURL, err := url.Parse(originRaw)
+	if err != nil {
+		return false
+	}
+	baseURL, err := url.Parse(baseURLRaw)
+	if err != nil {
+		return false
+	}
+	return sameOrigin(originURL, baseURL)
 }
 
 func (s *server) resolveHasuraAudience(ctx context.Context, appSlug string) (string, error) {

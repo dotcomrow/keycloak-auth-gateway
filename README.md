@@ -6,6 +6,7 @@ A small OIDC callback broker for Keycloak that supports:
 - DB-backed allowed app configuration
 - CRUD APIs for app management (for GUI use)
 - One-time code exchange API for apps (`/v1/auth/exchange`)
+- Dedicated audience token exchange API for MFEs (`/v1/auth/token-exchange`)
 
 ## Endpoints
 
@@ -13,6 +14,7 @@ A small OIDC callback broker for Keycloak that supports:
 - `GET /start?app=<slug>&return_to=<path-or-url>`
 - `GET /callback`
 - `POST /v1/auth/exchange`
+- `POST /v1/auth/token-exchange`
 - `GET /v1/apps`
 - `POST /v1/apps`
 - `GET /v1/apps/{slug}`
@@ -92,6 +94,43 @@ Vault lookup supports `{app_slug}` in the path template. Example:
 - `HASURA_TOKEN_AUDIENCE_VAULT_PATH=kv/data/keycloak/hasura/{app_slug}`
 - `HASURA_TOKEN_AUDIENCE_VAULT_KEY=audience`
 
+## MFE Audience Exchange API
+
+Use this when an MFE already has a bearer token and needs a different audience (or multiple audiences).
+
+Request:
+
+```sh
+curl -X POST http://localhost:8080/v1/auth/token-exchange \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <user_access_token>' \
+  -d '{
+    "app_slug":"shell",
+    "requested_audience":"graphql-api-7603d234"
+  }'
+```
+
+Multiple audiences (single exchanged token with multiple `aud` values):
+
+```sh
+curl -X POST http://localhost:8080/v1/auth/token-exchange \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <user_access_token>' \
+  -d '{
+    "app_slug":"shell",
+    "requested_audiences":["graphql-api-7603d234","openwebui"]
+  }'
+```
+
+Request body fields:
+
+- `app_slug` (required)
+- `subject_token` (optional if passed as `Authorization: Bearer ...`)
+- `requested_audience` (optional)
+- `requested_audiences` (optional array)
+- `requested_scope` (optional)
+- `request_hasura_claims` (optional; resolves audience using Hasura audience config if no audience is provided)
+
 ## Configuration
 
 ### Required
@@ -99,11 +138,13 @@ Vault lookup supports `{app_slug}` in the path template. Example:
 - `EXTERNAL_BASE_URL` (for example `https://login.suncoast.systems`)
 - `KEYCLOAK_ISSUER` (for example `https://auth.suncoast.systems/realms/external`)
 - `OIDC_CLIENT_ID`
+- `OIDC_EXCHANGE_CLIENT_ID` (optional; defaults to `OIDC_CLIENT_ID`)
 - Database config via `DATABASE_URL` or `DB_*` vars
 
 ### Optional
 
 - `OIDC_CLIENT_SECRET` or `OIDC_CLIENT_SECRET_FILE`
+- `OIDC_EXCHANGE_CLIENT_SECRET` or `OIDC_EXCHANGE_CLIENT_SECRET_FILE` (optional; defaults to `OIDC_CLIENT_SECRET`)
 - `ADMIN_API_TOKEN` or `ADMIN_API_TOKEN_FILE`
 - `CORS_ALLOW_ORIGINS` (comma-separated list or `*`)
 - `HASURA_TOKEN_AUDIENCE` or `HASURA_TOKEN_AUDIENCE_FILE` (fallback when `request_hasura_claims=true`)
