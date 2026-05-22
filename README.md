@@ -37,10 +37,15 @@ curl -X POST http://localhost:8080/v1/apps \
   -d '{
     "slug": "shell",
     "display_name": "Shell App",
-    "base_url": "https://shell.suncoast.systems",
+    "base_urls": [
+      "https://shell.suncoast.systems",
+      "http://localhost:4173"
+    ],
     "enabled": true
   }'
 ```
+
+`base_url` is still accepted for backward compatibility, but `base_urls` is preferred.
 
 ## Login Start Example
 
@@ -146,7 +151,7 @@ Request body fields:
 - `OIDC_CLIENT_SECRET` or `OIDC_CLIENT_SECRET_FILE`
 - `OIDC_EXCHANGE_CLIENT_SECRET` or `OIDC_EXCHANGE_CLIENT_SECRET_FILE` (optional; defaults to `OIDC_CLIENT_SECRET`)
 - `ADMIN_API_TOKEN` or `ADMIN_API_TOKEN_FILE`
-- `CORS_ALLOW_ORIGINS` (comma-separated list or `*`)
+- `CORS_ALLOW_ORIGINS` (comma-separated list, `*`, wildcard subdomain patterns like `*.suncoast.systems`, and `localhost`)
 - `HASURA_TOKEN_AUDIENCE` or `HASURA_TOKEN_AUDIENCE_FILE` (fallback when `request_hasura_claims=true`)
 - `VAULT_ADDR` (required when `HASURA_TOKEN_AUDIENCE_VAULT_PATH` is set)
 - `VAULT_TOKEN` or `VAULT_TOKEN_FILE` (required when `HASURA_TOKEN_AUDIENCE_VAULT_PATH` is set)

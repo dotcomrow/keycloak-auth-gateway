@@ -32,28 +32,36 @@ var (
 )
 
 type config struct {
-	ListenAddr          string
-	DatabaseURL         string
-	ExternalBaseURL     string
-	CallbackPath        string
-	Issuer              string
-	ClientID            string
-	ClientSecret        string
-	ExchangeClientID    string
+	ListenAddr           string
+	DatabaseURL          string
+	ExternalBaseURL      string
+	CallbackPath         string
+	Issuer               string
+	ClientID             string
+	ClientSecret         string
+	ExchangeClientID     string
 	ExchangeClientSecret string
-	Scope               string
-	HasuraTokenAudience string
-	VaultAddr           string
-	VaultToken          string
-	HasuraAudiencePath  string
-	HasuraAudienceKey   string
-	StateTTL            time.Duration
-	ExchangeCodeTTL     time.Duration
-	CleanupInterval     time.Duration
-	AppCodeParam        string
-	AdminAPIToken       string
-	CORSAllowAll        bool
-	CORSAllowedOrigins  map[string]struct{}
+	Scope                string
+	HasuraTokenAudience  string
+	VaultAddr            string
+	VaultToken           string
+	HasuraAudiencePath   string
+	HasuraAudienceKey    string
+	StateTTL             time.Duration
+	ExchangeCodeTTL      time.Duration
+	CleanupInterval      time.Duration
+	AppCodeParam         string
+	AdminAPIToken        string
+	CORSAllowAll         bool
+	CORSAllowedOrigins   map[string]struct{}
+	CORSAllowedPatterns  []corsOriginPattern
+}
+
+type corsOriginPattern struct {
+	Scheme     string
+	Port       string
+	HostExact  string
+	HostSuffix string
 }
 
 type server struct {
@@ -67,22 +75,25 @@ type appRecord struct {
 	Slug        string    `json:"slug"`
 	DisplayName string    `json:"display_name"`
 	BaseURL     string    `json:"base_url"`
+	BaseURLs    []string  `json:"base_urls"`
 	Enabled     bool      `json:"enabled"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type createAppRequest struct {
-	Slug        string `json:"slug"`
-	DisplayName string `json:"display_name"`
-	BaseURL     string `json:"base_url"`
-	Enabled     *bool  `json:"enabled"`
+	Slug        string   `json:"slug"`
+	DisplayName string   `json:"display_name"`
+	BaseURL     string   `json:"base_url"`
+	BaseURLs    []string `json:"base_urls"`
+	Enabled     *bool    `json:"enabled"`
 }
 
 type updateAppRequest struct {
-	DisplayName string `json:"display_name"`
-	BaseURL     string `json:"base_url"`
-	Enabled     *bool  `json:"enabled"`
+	DisplayName string   `json:"display_name"`
+	BaseURL     string   `json:"base_url"`
+	BaseURLs    []string `json:"base_urls"`
+	Enabled     *bool    `json:"enabled"`
 }
 
 type stateRecord struct {
@@ -224,19 +235,19 @@ func main() {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		ListenAddr:          getEnv("LISTEN_ADDR", ":8080"),
-		ExternalBaseURL:     strings.TrimRight(getEnv("EXTERNAL_BASE_URL", "https://login.suncoast.systems"), "/"),
-		CallbackPath:        normalizeCallbackPath(getEnv("CALLBACK_PATH", "/callback")),
-		Issuer:              strings.TrimRight(getEnv("KEYCLOAK_ISSUER", "https://auth.suncoast.systems/realms/external"), "/"),
-		ClientID:            getEnv("OIDC_CLIENT_ID", "auth-gateway-public"),
-		Scope:               getEnv("OIDC_SCOPE", "openid profile email"),
-		VaultAddr:           strings.TrimRight(getEnv("VAULT_ADDR", ""), "/"),
-		HasuraAudiencePath:  strings.TrimSpace(getEnv("HASURA_TOKEN_AUDIENCE_VAULT_PATH", "")),
-		HasuraAudienceKey:   strings.TrimSpace(getEnv("HASURA_TOKEN_AUDIENCE_VAULT_KEY", "audience")),
-		StateTTL:            parseDurationEnv("STATE_TTL", 10*time.Minute),
-		ExchangeCodeTTL:     parseDurationEnv("EXCHANGE_CODE_TTL", 2*time.Minute),
-		CleanupInterval:     parseDurationEnv("CLEANUP_INTERVAL", 5*time.Minute),
-		AppCodeParam:        getEnv("APP_CODE_PARAM", "gateway_code"),
+		ListenAddr:         getEnv("LISTEN_ADDR", ":8080"),
+		ExternalBaseURL:    strings.TrimRight(getEnv("EXTERNAL_BASE_URL", "https://login.suncoast.systems"), "/"),
+		CallbackPath:       normalizeCallbackPath(getEnv("CALLBACK_PATH", "/callback")),
+		Issuer:             strings.TrimRight(getEnv("KEYCLOAK_ISSUER", "https://auth.suncoast.systems/realms/external"), "/"),
+		ClientID:           getEnv("OIDC_CLIENT_ID", "auth-gateway-public"),
+		Scope:              getEnv("OIDC_SCOPE", "openid profile email"),
+		VaultAddr:          strings.TrimRight(getEnv("VAULT_ADDR", ""), "/"),
+		HasuraAudiencePath: strings.TrimSpace(getEnv("HASURA_TOKEN_AUDIENCE_VAULT_PATH", "")),
+		HasuraAudienceKey:  strings.TrimSpace(getEnv("HASURA_TOKEN_AUDIENCE_VAULT_KEY", "audience")),
+		StateTTL:           parseDurationEnv("STATE_TTL", 10*time.Minute),
+		ExchangeCodeTTL:    parseDurationEnv("EXCHANGE_CODE_TTL", 2*time.Minute),
+		CleanupInterval:    parseDurationEnv("CLEANUP_INTERVAL", 5*time.Minute),
+		AppCodeParam:       getEnv("APP_CODE_PARAM", "gateway_code"),
 	}
 	cfg.ExchangeClientID = strings.TrimSpace(getEnv("OIDC_EXCHANGE_CLIENT_ID", ""))
 	if cfg.ExchangeClientID == "" {
@@ -303,7 +314,7 @@ func loadConfig() (config, error) {
 		}
 	}
 
-	cfg.CORSAllowAll, cfg.CORSAllowedOrigins = parseAllowedOrigins(getEnv("CORS_ALLOW_ORIGINS", ""))
+	cfg.CORSAllowAll, cfg.CORSAllowedOrigins, cfg.CORSAllowedPatterns = parseAllowedOrigins(getEnv("CORS_ALLOW_ORIGINS", ""))
 
 	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if dsn == "" {
@@ -358,6 +369,7 @@ CREATE TABLE IF NOT EXISTS auth_gateway_allowed_apps (
   slug TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
   base_url TEXT NOT NULL,
+  base_urls JSONB NOT NULL DEFAULT '[]'::jsonb,
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -398,7 +410,29 @@ CREATE INDEX IF NOT EXISTS auth_gateway_exchange_codes_expires_idx
   ON auth_gateway_exchange_codes(expires_at);
 `
 
-	_, err := s.db.ExecContext(ctx, schemaSQL)
+	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
+		return err
+	}
+
+	const migrationSQL = `
+ALTER TABLE auth_gateway_allowed_apps
+  ADD COLUMN IF NOT EXISTS base_urls JSONB;
+
+UPDATE auth_gateway_allowed_apps
+SET base_urls = jsonb_build_array(base_url)
+WHERE base_urls IS NULL
+   OR CASE
+        WHEN jsonb_typeof(base_urls) = 'array' THEN jsonb_array_length(base_urls) = 0
+        ELSE TRUE
+      END;
+
+ALTER TABLE auth_gateway_allowed_apps
+  ALTER COLUMN base_urls SET DEFAULT '[]'::jsonb;
+
+ALTER TABLE auth_gateway_allowed_apps
+  ALTER COLUMN base_urls SET NOT NULL;
+`
+	_, err := s.db.ExecContext(ctx, migrationSQL)
 	return err
 }
 
@@ -467,7 +501,7 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	returnTo, err := normalizeReturnTo(app.BaseURL, strings.TrimSpace(r.URL.Query().Get("return_to")))
+	returnTo, err := normalizeReturnToAny(app.BaseURLs, strings.TrimSpace(r.URL.Query().Get("return_to")))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -680,8 +714,8 @@ func (s *server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin != "" && !sameOriginString(origin, app.BaseURL) {
-		writeError(w, http.StatusForbidden, "origin does not match app base_url")
+	if origin != "" && !sameOriginInList(origin, app.BaseURLs) {
+		writeError(w, http.StatusForbidden, "origin does not match app base_urls")
 		return
 	}
 
@@ -839,7 +873,7 @@ func (s *server) handleAppBySlug(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) listApps(ctx context.Context) ([]appRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT slug, display_name, base_url, enabled, created_at, updated_at
+SELECT slug, display_name, base_url, COALESCE(base_urls, jsonb_build_array(base_url))::text AS base_urls, enabled, created_at, updated_at
 FROM auth_gateway_allowed_apps
 ORDER BY slug`)
 	if err != nil {
@@ -850,8 +884,13 @@ ORDER BY slug`)
 	apps := make([]appRecord, 0)
 	for rows.Next() {
 		var a appRecord
-		if err := rows.Scan(&a.Slug, &a.DisplayName, &a.BaseURL, &a.Enabled, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		var baseURLsRaw string
+		if err := rows.Scan(&a.Slug, &a.DisplayName, &a.BaseURL, &baseURLsRaw, &a.Enabled, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
+		}
+		a.BaseURLs = parseStoredBaseURLs(baseURLsRaw, a.BaseURL)
+		if len(a.BaseURLs) > 0 {
+			a.BaseURL = a.BaseURLs[0]
 		}
 		apps = append(apps, a)
 	}
@@ -860,47 +899,70 @@ ORDER BY slug`)
 
 func (s *server) getApp(ctx context.Context, slug string) (appRecord, error) {
 	var a appRecord
+	var baseURLsRaw string
 	err := s.db.QueryRowContext(ctx, `
-SELECT slug, display_name, base_url, enabled, created_at, updated_at
+SELECT slug, display_name, base_url, COALESCE(base_urls, jsonb_build_array(base_url))::text AS base_urls, enabled, created_at, updated_at
 FROM auth_gateway_allowed_apps
-WHERE slug=$1`, slug).Scan(&a.Slug, &a.DisplayName, &a.BaseURL, &a.Enabled, &a.CreatedAt, &a.UpdatedAt)
+WHERE slug=$1`, slug).Scan(&a.Slug, &a.DisplayName, &a.BaseURL, &baseURLsRaw, &a.Enabled, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return appRecord{}, errNotFound
 		}
 		return appRecord{}, err
+	}
+	a.BaseURLs = parseStoredBaseURLs(baseURLsRaw, a.BaseURL)
+	if len(a.BaseURLs) > 0 {
+		a.BaseURL = a.BaseURLs[0]
 	}
 	return a, nil
 }
 
 func (s *server) createApp(ctx context.Context, app appRecord) (appRecord, error) {
 	var out appRecord
-	err := s.db.QueryRowContext(ctx, `
-INSERT INTO auth_gateway_allowed_apps (slug, display_name, base_url, enabled)
-VALUES ($1,$2,$3,$4)
-RETURNING slug, display_name, base_url, enabled, created_at, updated_at`,
-		app.Slug, app.DisplayName, app.BaseURL, app.Enabled,
-	).Scan(&out.Slug, &out.DisplayName, &out.BaseURL, &out.Enabled, &out.CreatedAt, &out.UpdatedAt)
+	var baseURLsRaw string
+	baseURLsJSON, err := json.Marshal(app.BaseURLs)
 	if err != nil {
 		return appRecord{}, err
+	}
+	err = s.db.QueryRowContext(ctx, `
+INSERT INTO auth_gateway_allowed_apps (slug, display_name, base_url, base_urls, enabled)
+VALUES ($1,$2,$3,CAST($4 AS jsonb),$5)
+RETURNING slug, display_name, base_url, COALESCE(base_urls, jsonb_build_array(base_url))::text AS base_urls, enabled, created_at, updated_at`,
+		app.Slug, app.DisplayName, app.BaseURL, string(baseURLsJSON), app.Enabled,
+	).Scan(&out.Slug, &out.DisplayName, &out.BaseURL, &baseURLsRaw, &out.Enabled, &out.CreatedAt, &out.UpdatedAt)
+	if err != nil {
+		return appRecord{}, err
+	}
+	out.BaseURLs = parseStoredBaseURLs(baseURLsRaw, out.BaseURL)
+	if len(out.BaseURLs) > 0 {
+		out.BaseURL = out.BaseURLs[0]
 	}
 	return out, nil
 }
 
 func (s *server) updateApp(ctx context.Context, app appRecord) (appRecord, error) {
 	var out appRecord
-	err := s.db.QueryRowContext(ctx, `
+	var baseURLsRaw string
+	baseURLsJSON, err := json.Marshal(app.BaseURLs)
+	if err != nil {
+		return appRecord{}, err
+	}
+	err = s.db.QueryRowContext(ctx, `
 UPDATE auth_gateway_allowed_apps
-SET display_name=$2, base_url=$3, enabled=$4, updated_at=NOW()
+SET display_name=$2, base_url=$3, base_urls=CAST($4 AS jsonb), enabled=$5, updated_at=NOW()
 WHERE slug=$1
-RETURNING slug, display_name, base_url, enabled, created_at, updated_at`,
-		app.Slug, app.DisplayName, app.BaseURL, app.Enabled,
-	).Scan(&out.Slug, &out.DisplayName, &out.BaseURL, &out.Enabled, &out.CreatedAt, &out.UpdatedAt)
+RETURNING slug, display_name, base_url, COALESCE(base_urls, jsonb_build_array(base_url))::text AS base_urls, enabled, created_at, updated_at`,
+		app.Slug, app.DisplayName, app.BaseURL, string(baseURLsJSON), app.Enabled,
+	).Scan(&out.Slug, &out.DisplayName, &out.BaseURL, &baseURLsRaw, &out.Enabled, &out.CreatedAt, &out.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return appRecord{}, errNotFound
 		}
 		return appRecord{}, err
+	}
+	out.BaseURLs = parseStoredBaseURLs(baseURLsRaw, out.BaseURL)
+	if len(out.BaseURLs) > 0 {
+		out.BaseURL = out.BaseURLs[0]
 	}
 	return out, nil
 }
@@ -1135,6 +1197,31 @@ func sameOriginString(originRaw, baseURLRaw string) bool {
 	return sameOrigin(originURL, baseURL)
 }
 
+func sameOriginInList(originRaw string, baseURLs []string) bool {
+	for _, baseURL := range baseURLs {
+		if sameOriginString(originRaw, baseURL) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseStoredBaseURLs(rawJSON, fallback string) []string {
+	rawJSON = strings.TrimSpace(rawJSON)
+	values := make([]string, 0)
+	if rawJSON != "" && rawJSON != "null" {
+		_ = json.Unmarshal([]byte(rawJSON), &values)
+	}
+	out := dedupeAndNormalizeURLs(values)
+	if len(out) > 0 {
+		return out
+	}
+	if fb, err := normalizeBaseURL(fallback); err == nil {
+		return []string{fb}
+	}
+	return []string{}
+}
+
 func (s *server) resolveHasuraAudience(ctx context.Context, appSlug string) (string, error) {
 	if s.cfg.HasuraAudiencePath != "" {
 		return s.lookupHasuraAudienceFromVault(ctx, appSlug)
@@ -1307,7 +1394,19 @@ func (s *server) isOriginAllowed(origin string) bool {
 		return true
 	}
 	_, ok := s.cfg.CORSAllowedOrigins[origin]
-	return ok
+	if ok {
+		return true
+	}
+	originURL, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	for _, pattern := range s.cfg.CORSAllowedPatterns {
+		if originMatchesPattern(originURL, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateAndBuildCreate(req createAppRequest) (appRecord, error) {
@@ -1319,7 +1418,7 @@ func validateAndBuildCreate(req createAppRequest) (appRecord, error) {
 	if displayName == "" {
 		return appRecord{}, fmt.Errorf("display_name is required")
 	}
-	baseURL, err := normalizeBaseURL(req.BaseURL)
+	baseURLs, err := normalizeBaseURLsInput(req.BaseURL, req.BaseURLs)
 	if err != nil {
 		return appRecord{}, err
 	}
@@ -1327,7 +1426,13 @@ func validateAndBuildCreate(req createAppRequest) (appRecord, error) {
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
-	return appRecord{Slug: slug, DisplayName: displayName, BaseURL: baseURL, Enabled: enabled}, nil
+	return appRecord{
+		Slug:        slug,
+		DisplayName: displayName,
+		BaseURL:     baseURLs[0],
+		BaseURLs:    baseURLs,
+		Enabled:     enabled,
+	}, nil
 }
 
 func validateAndBuildUpdate(slug string, req updateAppRequest) (appRecord, error) {
@@ -1339,7 +1444,7 @@ func validateAndBuildUpdate(slug string, req updateAppRequest) (appRecord, error
 	if displayName == "" {
 		return appRecord{}, fmt.Errorf("display_name is required")
 	}
-	baseURL, err := normalizeBaseURL(req.BaseURL)
+	baseURLs, err := normalizeBaseURLsInput(req.BaseURL, req.BaseURLs)
 	if err != nil {
 		return appRecord{}, err
 	}
@@ -1347,7 +1452,68 @@ func validateAndBuildUpdate(slug string, req updateAppRequest) (appRecord, error
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
-	return appRecord{Slug: slug, DisplayName: displayName, BaseURL: baseURL, Enabled: enabled}, nil
+	return appRecord{
+		Slug:        slug,
+		DisplayName: displayName,
+		BaseURL:     baseURLs[0],
+		BaseURLs:    baseURLs,
+		Enabled:     enabled,
+	}, nil
+}
+
+func normalizeBaseURLsInput(baseURL string, baseURLs []string) ([]string, error) {
+	normalizedList := make([]string, 0, len(baseURLs)+1)
+	seen := make(map[string]struct{}, len(baseURLs)+1)
+	for idx, raw := range baseURLs {
+		normalized, err := normalizeBaseURL(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base_urls[%d]: %w", idx, err)
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		normalizedList = append(normalizedList, normalized)
+	}
+	if single := strings.TrimSpace(baseURL); single != "" {
+		normSingle, err := normalizeBaseURL(single)
+		if err != nil {
+			return nil, err
+		}
+		if !containsString(normalizedList, normSingle) {
+			normalizedList = append([]string{normSingle}, normalizedList...)
+		}
+	}
+	if len(normalizedList) == 0 {
+		return nil, fmt.Errorf("base_url or base_urls is required")
+	}
+	return normalizedList, nil
+}
+
+func dedupeAndNormalizeURLs(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		normalized, err := normalizeBaseURL(raw)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeBaseURL(raw string) (string, error) {
@@ -1380,46 +1546,62 @@ func normalizeBaseURL(raw string) (string, error) {
 	return u.String(), nil
 }
 
-func normalizeReturnTo(baseRaw, returnRaw string) (string, error) {
-	base, err := url.Parse(baseRaw)
-	if err != nil {
-		return "", fmt.Errorf("configured base_url is invalid")
+func normalizeReturnToAny(baseURLs []string, returnRaw string) (string, error) {
+	allowed := make([]*url.URL, 0, len(baseURLs))
+	for _, baseRaw := range baseURLs {
+		base, err := url.Parse(strings.TrimSpace(baseRaw))
+		if err != nil || !base.IsAbs() {
+			continue
+		}
+		allowed = append(allowed, base)
+	}
+	if len(allowed) == 0 {
+		return "", fmt.Errorf("configured base_urls are invalid")
 	}
 
 	if strings.TrimSpace(returnRaw) == "" {
-		return base.String(), nil
+		return allowed[0].String(), nil
 	}
 
-	candidate, err := url.Parse(strings.TrimSpace(returnRaw))
+	raw := strings.TrimSpace(returnRaw)
+	candidate, err := url.Parse(raw)
 	if err != nil {
 		return "", fmt.Errorf("return_to is invalid")
 	}
 
 	if candidate.IsAbs() {
-		if !sameOrigin(base, candidate) {
-			return "", fmt.Errorf("return_to host is not allowed")
+		hostAllowed := false
+		for _, base := range allowed {
+			if sameOrigin(base, candidate) {
+				hostAllowed = true
+				if pathAllowed(base.Path, candidate.Path) {
+					return candidate.String(), nil
+				}
+			}
 		}
-		if !pathAllowed(base.Path, candidate.Path) {
-			return "", fmt.Errorf("return_to path is outside app base_url")
+		if hostAllowed {
+			return "", fmt.Errorf("return_to path is outside app base_urls")
 		}
-		return candidate.String(), nil
+		return "", fmt.Errorf("return_to host is not allowed")
 	}
 
-	if !strings.HasPrefix(returnRaw, "/") {
+	if !strings.HasPrefix(raw, "/") {
 		return "", fmt.Errorf("relative return_to must start with '/'")
 	}
-	if !pathAllowed(base.Path, candidate.Path) {
-		return "", fmt.Errorf("return_to path is outside app base_url")
+	for _, base := range allowed {
+		if !pathAllowed(base.Path, candidate.Path) {
+			continue
+		}
+		resolved := &url.URL{
+			Scheme:   base.Scheme,
+			Host:     base.Host,
+			Path:     candidate.Path,
+			RawQuery: candidate.RawQuery,
+			Fragment: candidate.Fragment,
+		}
+		return resolved.String(), nil
 	}
-
-	resolved := &url.URL{
-		Scheme:   base.Scheme,
-		Host:     base.Host,
-		Path:     candidate.Path,
-		RawQuery: candidate.RawQuery,
-		Fragment: candidate.Fragment,
-	}
-	return resolved.String(), nil
+	return "", fmt.Errorf("return_to path is outside app base_urls")
 }
 
 func pathAllowed(basePath, candidatePath string) bool {
@@ -1479,19 +1661,125 @@ func randomToken(byteLen int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-func parseAllowedOrigins(raw string) (bool, map[string]struct{}) {
+func parseAllowedOrigins(raw string) (bool, map[string]struct{}, []corsOriginPattern) {
 	out := map[string]struct{}{}
+	patterns := make([]corsOriginPattern, 0)
 	for _, part := range strings.Split(raw, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
 		if part == "*" {
-			return true, map[string]struct{}{}
+			return true, map[string]struct{}{}, []corsOriginPattern{}
+		}
+		if pattern, ok := parseOriginPattern(part); ok {
+			patterns = append(patterns, pattern)
+			continue
 		}
 		out[part] = struct{}{}
 	}
-	return false, out
+	return false, out, patterns
+}
+
+func parseOriginPattern(raw string) (corsOriginPattern, bool) {
+	part := strings.TrimSpace(raw)
+	if part == "" {
+		return corsOriginPattern{}, false
+	}
+
+	pattern := corsOriginPattern{}
+	normalized := part
+	hasScheme := strings.Contains(normalized, "://")
+	if !hasScheme {
+		normalized = "https://" + normalized
+	}
+
+	parsed, err := url.Parse(normalized)
+	if err != nil {
+		return corsOriginPattern{}, false
+	}
+	if parsed.Host == "" {
+		return corsOriginPattern{}, false
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return corsOriginPattern{}, false
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return corsOriginPattern{}, false
+	}
+
+	if hasScheme {
+		scheme := strings.ToLower(parsed.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return corsOriginPattern{}, false
+		}
+		pattern.Scheme = scheme
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	pattern.Port = parsed.Port()
+	switch {
+	case host == "localhost":
+		pattern.HostExact = "localhost"
+		return pattern, true
+	case strings.HasPrefix(host, "*.") && len(host) > 2:
+		if strings.Contains(host[2:], "*") {
+			return corsOriginPattern{}, false
+		}
+		pattern.HostSuffix = host[1:]
+		return pattern, true
+	default:
+		return corsOriginPattern{}, false
+	}
+}
+
+func originMatchesPattern(originURL *url.URL, pattern corsOriginPattern) bool {
+	if originURL == nil {
+		return false
+	}
+	scheme := strings.ToLower(originURL.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	if pattern.Scheme != "" && pattern.Scheme != scheme {
+		return false
+	}
+	if pattern.Port != "" && pattern.Port != effectiveURLPort(originURL) {
+		return false
+	}
+
+	host := strings.ToLower(originURL.Hostname())
+	if host == "" {
+		return false
+	}
+	if pattern.HostExact != "" {
+		return host == pattern.HostExact
+	}
+	if pattern.HostSuffix != "" {
+		if !strings.HasSuffix(host, pattern.HostSuffix) {
+			return false
+		}
+		trimmed := strings.TrimSuffix(host, pattern.HostSuffix)
+		return trimmed != ""
+	}
+	return false
+}
+
+func effectiveURLPort(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
