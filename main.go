@@ -25,6 +25,14 @@ import (
 
 var slugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}$`)
 
+const tokenEndpointMaxAttempts = 4
+
+var tokenEndpointRetryBackoff = []time.Duration{
+	200 * time.Millisecond,
+	500 * time.Millisecond,
+	1 * time.Second,
+}
+
 var (
 	errNotFound                    = errors.New("not found")
 	errExpired                     = errors.New("expired")
@@ -1059,35 +1067,7 @@ func (s *server) exchangeAuthorizationCode(ctx context.Context, code, codeVerifi
 		form.Set("client_secret", s.cfg.ClientSecret)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return tokenResponse{}, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	res, err := s.http.Do(req)
-	if err != nil {
-		return tokenResponse{}, err
-	}
-	defer res.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
-	if err != nil {
-		return tokenResponse{}, err
-	}
-
-	if res.StatusCode != http.StatusOK {
-		return tokenResponse{}, fmt.Errorf("token endpoint returned %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var out tokenResponse
-	if err := json.Unmarshal(body, &out); err != nil {
-		return tokenResponse{}, err
-	}
-	if out.AccessToken == "" {
-		return tokenResponse{}, fmt.Errorf("token response missing access_token")
-	}
-	return out, nil
+	return s.postTokenFormWithRetry(ctx, endpoint, form, "token endpoint", "token response")
 }
 
 func (s *server) exchangeAccessToken(ctx context.Context, subjectToken string, audiences []string, scope string) (tokenResponse, error) {
@@ -1112,34 +1092,79 @@ func (s *server) exchangeAccessToken(ctx context.Context, subjectToken string, a
 		form.Set("client_secret", s.cfg.ExchangeClientSecret)
 	}
 
+	return s.postTokenFormWithRetry(ctx, endpoint, form, "token exchange endpoint", "token exchange response")
+}
+
+func (s *server) postTokenFormWithRetry(ctx context.Context, endpoint string, form url.Values, endpointLabel string, responseLabel string) (tokenResponse, error) {
+	var lastErr error
+
+	for attempt := 1; attempt <= tokenEndpointMaxAttempts; attempt++ {
+		out, retryable, err := s.postTokenForm(ctx, endpoint, form, endpointLabel, responseLabel)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+
+		if ctx.Err() != nil {
+			return tokenResponse{}, ctx.Err()
+		}
+		if !retryable || attempt == tokenEndpointMaxAttempts {
+			return tokenResponse{}, err
+		}
+
+		backoff := tokenEndpointRetryBackoff[min(attempt-1, len(tokenEndpointRetryBackoff)-1)]
+		if s.logger != nil {
+			s.logger.Printf("%s attempt %d/%d failed with retryable error: %v; retrying in %s", endpointLabel, attempt, tokenEndpointMaxAttempts, err, backoff)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return tokenResponse{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return tokenResponse{}, lastErr
+}
+
+func (s *server) postTokenForm(ctx context.Context, endpoint string, form url.Values, endpointLabel string, responseLabel string) (tokenResponse, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return tokenResponse{}, err
+		return tokenResponse{}, false, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	res, err := s.http.Do(req)
 	if err != nil {
-		return tokenResponse{}, err
+		return tokenResponse{}, true, err
 	}
 	defer res.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
 	if err != nil {
-		return tokenResponse{}, err
+		return tokenResponse{}, true, err
 	}
 	if res.StatusCode != http.StatusOK {
-		return tokenResponse{}, fmt.Errorf("token exchange endpoint returned %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+		return tokenResponse{}, isRetryableTokenEndpointStatus(res.StatusCode), fmt.Errorf("%s returned %d: %s", endpointLabel, res.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var out tokenResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return tokenResponse{}, err
+		return tokenResponse{}, false, err
 	}
 	if out.AccessToken == "" {
-		return tokenResponse{}, fmt.Errorf("token exchange response missing access_token")
+		return tokenResponse{}, false, fmt.Errorf("%s missing access_token", responseLabel)
 	}
-	return out, nil
+	return out, false, nil
+}
+
+func isRetryableTokenEndpointStatus(status int) bool {
+	return status == http.StatusTooManyRequests ||
+		status == http.StatusInternalServerError ||
+		status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout
 }
 
 func bearerTokenFromHeader(headerValue string) string {

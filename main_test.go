@@ -1,7 +1,14 @@
 package main
 
 import (
+	"context"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -88,3 +95,93 @@ func TestOriginMatchesPattern_SchemeAndPort(t *testing.T) {
 	}
 }
 
+func TestExchangeAuthorizationCodeRetriesTransientTokenEndpointFailure(t *testing.T) {
+	var attempts int32
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/protocol/openid-connect/token" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Fatalf("unexpected method %q", r.Method)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+			t.Fatalf("unexpected content-type %q", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		if values.Get("grant_type") != "authorization_code" {
+			t.Fatalf("unexpected grant_type %q", values.Get("grant_type"))
+		}
+		if values.Get("code") != "auth-code" {
+			t.Fatalf("unexpected code %q", values.Get("code"))
+		}
+
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			http.Error(w, `{"error":"unknown_error"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"access","id_token":"id","expires_in":900}`))
+	}))
+	defer tokenServer.Close()
+
+	s := server{
+		cfg: config{
+			Issuer:          tokenServer.URL,
+			ClientID:        "auth-gateway-public",
+			ClientSecret:    "secret",
+			ExternalBaseURL: "https://login-internal.suncoast.systems",
+			CallbackPath:    "/callback",
+		},
+		http:   tokenServer.Client(),
+		logger: log.New(io.Discard, "", 0),
+	}
+
+	tokens, err := s.exchangeAuthorizationCode(context.Background(), "auth-code", "verifier")
+	if err != nil {
+		t.Fatalf("exchangeAuthorizationCode returned error: %v", err)
+	}
+	if tokens.AccessToken != "access" {
+		t.Fatalf("unexpected access token %q", tokens.AccessToken)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("expected 2 attempts, got %d", got)
+	}
+}
+
+func TestExchangeAuthorizationCodeDoesNotRetryInvalidGrant(t *testing.T) {
+	var attempts int32
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+	}))
+	defer tokenServer.Close()
+
+	s := server{
+		cfg: config{
+			Issuer:          tokenServer.URL,
+			ClientID:        "auth-gateway-public",
+			ExternalBaseURL: "https://login-internal.suncoast.systems",
+			CallbackPath:    "/callback",
+		},
+		http:   tokenServer.Client(),
+		logger: log.New(io.Discard, "", 0),
+	}
+
+	_, err := s.exchangeAuthorizationCode(context.Background(), "auth-code", "verifier")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Fatalf("expected status in error, got %v", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("expected 1 attempt, got %d", got)
+	}
+}
