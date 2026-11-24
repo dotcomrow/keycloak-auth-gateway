@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -11,6 +13,32 @@ import (
 	"sync/atomic"
 	"testing"
 )
+
+func unsignedTestToken(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+}
+
+func TestExtractSubjectPrefersStableIdentity(t *testing.T) {
+	token := unsignedTestToken(t, map[string]any{
+		"sub":                   "keycloak-generated-uuid",
+		"suncoast_identity_id": "github:123456789",
+	})
+	if got := extractSubject(token); got != "github:123456789" {
+		t.Fatalf("expected stable identity, got %q", got)
+	}
+}
+
+func TestExtractSubjectFallsBackForRollingUpgrade(t *testing.T) {
+	token := unsignedTestToken(t, map[string]any{"sub": "legacy-subject"})
+	if got := extractSubject(token); got != "legacy-subject" {
+		t.Fatalf("expected legacy subject fallback, got %q", got)
+	}
+}
 
 func TestParseAllowedOrigins_All(t *testing.T) {
 	allowAll, exact, patterns := parseAllowedOrigins("https://a.suncoast.systems,*")

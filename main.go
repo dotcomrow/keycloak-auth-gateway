@@ -1674,8 +1674,11 @@ func extractSubject(idToken string) string {
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return ""
 	}
+	if stable, _ := claims["suncoast_identity_id"].(string); strings.TrimSpace(stable) != "" {
+		return strings.TrimSpace(stable)
+	}
 	sub, _ := claims["sub"].(string)
-	return sub
+	return strings.TrimSpace(sub)
 }
 
 func randomToken(byteLen int) (string, error) {
